@@ -3,7 +3,7 @@ from neo4j import GraphDatabase
 from logic.preprocessor import Preprocessor
 
 NEO4J_URI = "bolt://localhost:7687"
-NEO4J_USER = "test"
+NEO4J_USER = "neo4j"
 NEO4J_PASSWORD = "test_password"
 
 app = Flask(__name__)
