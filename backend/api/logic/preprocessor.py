@@ -3,9 +3,20 @@ import re
 
 class Preprocessor():
 
+    REQUIRED_COLUMNS = ['Title', 'Sub-Title', 'YouTube Link', 'What it Does', 'Built With', 'By', 'Location', 'Project Link']
+
     def __init__(self, file_path):
+        self.file_path = file_path
         self.df = pd.read_csv(file_path)
 
+    def validate_columns(self):
+        """
+        Validar si las columnas del CSV son las requeridas
+        """
+        missing_columns = [col for col in self.REQUIRED_COLUMNS if col not in self.df.columns]
+        if missing_columns:
+            raise ValueError(f"Columnas faltantes en el CSV: {', '.join(missing_columns)}")
+    
     def preprocess_data(self):
         self.clean_data()
         self.normalize_data()
@@ -14,46 +25,31 @@ class Preprocessor():
         self.export_preproccessed_data()
 
     def clean_data(self):
-        """
-            1. Limpieza básica
-            Eliminar espacios adicionales al inicio y al final de las celdas
-        """
         self.df = self.df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
-
-        # Convertir a minúsculas los campos relevantes para evitar duplicados por formato
         self.df['Built With'] = self.df['Built With'].str.lower()
         self.df['By'] = self.df['By'].str.lower()
 
     def normalize_data(self):
-        """
-            2. Normalización del campo 'By' (creadores)
-            Los creadores pueden estar separados por "," o "&", unificamos los delimitadores
-
-            3. Normalización del campo 'Built With' (tecnologías)
-            Separar tecnologías por coma
-        """
         self.df['By'] = self.df['By'].apply(lambda x: re.split(r',|&', str(x)))
         self.df['Built With'] = self.df['Built With'].apply(lambda x: str(x).split(','))
 
     def create_nodes_and_relations(self):
-        """
-            4. Crear nodos y relaciones
-            Generar una lista de nodos de aplicaciones, creadores y tecnologías
-        """
-        self.applications = self.df[['Title', 'Location', 'Project Link']].drop_duplicates()
-        self.creators = set()
-        for creator_list in self.df['By']:
-            self.creators.update([creator.strip() for creator in creator_list])
-        self.creators = list(self.creators)
-
-        # Crear una lista de nodos de tecnologías
+        self.applications = self.df[['Title', 'Project Link']].drop_duplicates()
+        creator_set = set()
+        self.creators = []
+        for i, row in self.df.iterrows():
+            location = row['Location']
+            for creator in row['By']:
+                creator_cleaned = creator.strip()
+                if creator_cleaned not in creator_set:
+                    self.creators.append({'Creator': creator_cleaned, 'Location': location})
+                    creator_set.add(creator_cleaned)
         self.technologies = set()
         for tech_list in self.df['Built With']:
             self.technologies.update([tech.strip() for tech in tech_list])
         self.technologies = list(self.technologies)
 
     def generate_relations(self):
-        # 5. Generar relaciones entre aplicaciones, creadores y tecnologías
         self.relations_app_creator = []
         for i, row in self.df.iterrows():
             app_title = row['Title']
@@ -67,14 +63,11 @@ class Preprocessor():
                 self.relations_app_tech.append((app_title, tech.strip()))
 
     def export_preproccessed_data(self):
-        """
-            6. Exportar datos para Neo4j
-            Exportar los nodos y relaciones a archivos CSV o directamente preparar para cargar en Neo4j
-        """
-        applications_df = pd.DataFrame(self.applications, columns=['Title', 'Location', 'Project Link'])
+        # Exportar los archivos procesados a CSV
+        applications_df = pd.DataFrame(self.applications, columns=['Title', 'Project Link'])
         applications_df.to_csv('preprocessed_files/applications.csv', index=False)
 
-        creators_df = pd.DataFrame(self.creators, columns=['Creator'])
+        creators_df = pd.DataFrame(self.creators, columns=['Creator', 'Location'])
         creators_df.to_csv('preprocessed_files/creators.csv', index=False)
 
         technologies_df = pd.DataFrame(self.technologies, columns=['Technology'])
@@ -87,3 +80,44 @@ class Preprocessor():
         relations_app_tech_df.to_csv('preprocessed_files/relations_app_tech.csv', index=False)
 
         print("Preprocesamiento completado y datos exportados.")
+
+    def save_to_neo4j(self, neo4j_driver):
+        """
+        Guardar nodos y relaciones en la base de datos de Neo4j
+        """
+        with neo4j_driver.session() as session:
+            # Insertar nodos de aplicaciones
+            for app in self.applications.itertuples(index=False, name=None):
+                print("app:")
+                print(app)
+                print("self.applications")
+                print(self.applications)
+                print("self.applications.itertuples(index=False)")
+                print(self.applications.itertuples(index=False, name=None))
+                session.run("CREATE (a:Application {title: $title, projectLink: $projectLink})", 
+                            {"title": app[0], "projectLink": app[1]})
+
+            # Insertar nodos de creadores
+            for creator in self.creators:
+                session.run("CREATE (c:Creator {creator: $creator, location: $location})", 
+                            {"creator": creator['Creator'], "location": creator['Location']})
+
+            # Insertar nodos de tecnologías
+            for tech in self.technologies:
+                session.run("CREATE (t:Technology {technology: $technology})", {"technology": tech})
+
+            # Insertar relaciones entre aplicaciones y creadores
+            for app_title, creator_name in self.relations_app_creator:
+                session.run("""
+                MATCH (a:Application {title: $app_title}), (c:Creator {creator: $creator_name})
+                CREATE (a)-[:CREATED_BY]->(c)
+                """, {"app_title": app_title, "creator_name": creator_name})
+
+            # Insertar relaciones entre aplicaciones y tecnologías
+            for app_title, tech_name in self.relations_app_tech:
+                session.run("""
+                MATCH (a:Application {title: $app_title}), (t:Technology {technology: $tech_name})
+                CREATE (a)-[:USES]->(t)
+                """, {"app_title": app_title, "tech_name": tech_name})
+
+        print("Datos guardados en Neo4j correctamente")
