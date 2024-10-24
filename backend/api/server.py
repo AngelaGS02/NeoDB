@@ -2,8 +2,12 @@ from http.client import SERVICE_UNAVAILABLE
 import os
 from aiohttp import BasicAuth
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # Importar CORS
 from neo4j import GraphDatabase
 from logic.preprocessor import Preprocessor
+from datetime import datetime
+from neo4j.time import DateTime as Neo4jDateTime
+
 
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
@@ -12,6 +16,14 @@ UPLOAD_FOLDER = 'uploads'
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"], "allow_headers": "*"}})
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return response
 
 
 try:
@@ -30,6 +42,46 @@ def execute_query(query, parameters=None):
     with driver.session() as session:
         result = session.run(query, parameters)
         return result.data()
+
+def create_initial_indexes():
+    indexes = [
+        {"label": "Application", "property": "title"},
+        {"label": "Creator", "property": "creator"},
+        {"label": "Technology", "property": "technology"},
+    ]
+    for index in indexes:
+        try:
+            query = f"CREATE INDEX {index['label'].lower()}_{index['property']}_index FOR (n:{index['label']}) ON (n.{index['property']})"
+            execute_query(query)
+            print(f"Índice creado para {index['label']}.{index['property']}")
+        except Exception as e:
+            print(f"Error creando el índice para {index['label']}.{index['property']}: {str(e)}")
+
+
+
+def serialize_result(result):
+    """ Helper function to serialize Neo4j result to JSON serializable format. """
+    serialized_data = []
+    for record in result:
+        serialized_record = {}
+        for key, value in record.items():
+            if isinstance(value, datetime) or isinstance(value, Neo4jDateTime):
+                serialized_record[key] = value.isoformat() if value else None
+            else:
+                serialized_record[key] = value
+        serialized_data.append(serialized_record)
+    return serialized_data
+
+@app.route('/show-indexes', methods=['GET'])
+def show_indexes():
+    try:
+        query = "SHOW INDEXES"
+        result = execute_query(query)
+        serialized_result = serialize_result(result)
+        return jsonify(serialized_result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route('/', methods=['GET'])
 def test():
@@ -63,6 +115,18 @@ def upload_csv():
             return jsonify({"error": "Error procesando el archivo CSV", "details": str(e)}), 500
 
     return jsonify({"error": "Formato de archivo no válido, se requiere un archivo .csv"}), 400
+
+
+@app.route('/clear-database', methods=['DELETE'])
+def clear_database():
+    try:
+        with driver.session() as session:
+            # Eliminar todas las relaciones y luego los nodos
+            session.run("MATCH (n) DETACH DELETE n")
+        return jsonify({"message": "Base de datos limpiada correctamente"}), 200
+    except Exception as e:
+        return jsonify({"error": "Error al limpiar la base de datos", "details": str(e)}), 500
+
 
 @app.route('/nodes/<node_type>', methods=['POST'])
 def create_node(node_type):
@@ -140,20 +204,31 @@ def update_node(node_type, node_id):
 
 @app.route('/nodes/<node_type>/<node_id>', methods=['DELETE'])
 def delete_node(node_type, node_id):
-    if node_type == "application":
-        query = "MATCH (a:Application {title: $title}) DELETE a"
-        params = {"title": node_id}
-    elif node_type == "creator":
-        query = "MATCH (c:Creator {creator: $creator}) DELETE c"
-        params = {"creator": node_id}
-    elif node_type == "technology":
-        query = "MATCH (t:Technology {technology: $technology}) DELETE t"
-        params = {"technology": node_id}
-    else:
-        return jsonify({"error": "Tipo de nodo inválido"}), 400
+    try:
+        key_field = {
+            "application": "title",
+            "creator": "creator",
+            "technology": "technology"
+        }.get(node_type, "title")
 
-    execute_query(query, params)
-    return jsonify({"message": f"{node_type.capitalize()} '{node_id}' eliminado"}), 200
+        query_delete_relations = f"""
+        MATCH (n:{node_type.capitalize()} {{{key_field}: $node_id}})-[r]-()
+        DELETE r
+        """
+        params = {"node_id": node_id}
+        execute_query(query_delete_relations, params)
+
+        query_delete_node = f"""
+        MATCH (n:{node_type.capitalize()} {{{key_field}: $node_id}})
+        DELETE n
+        """
+        execute_query(query_delete_node, params)
+
+        return jsonify({"message": f"Nodo '{node_id}' eliminado junto con sus relaciones"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route('/relations', methods=['POST'])
 def create_relation():
@@ -181,6 +256,44 @@ def create_relation():
 
     result = execute_query(query, params)
     return jsonify(result), 201
+
+@app.route('/relations', methods=['GET'])
+def get_relations():
+    relation_type = request.args.get('relationType')
+    if not relation_type:
+        return jsonify({"error": "relationType es requerido"}), 400
+
+    query = f"""
+    MATCH (n1)-[r:{relation_type}]->(n2)
+    RETURN id(r) as id, properties(r) as properties, n1.title as from_title, n2.title as to_title
+    """
+    
+    results = execute_query(query)
+    if not results:
+        return jsonify({"message": "No se encontraron relaciones"}), 404
+
+    formatted_results = []
+    for result in results:
+        formatted_results.append({
+            "id": result["id"],
+            "from_title": result["from_title"],
+            "to_title": result["to_title"],
+            "properties": result.get("properties", {})
+        })
+
+    return jsonify(formatted_results), 200
+
+@app.route('/relations/<int:relation_id>', methods=['DELETE'])
+def delete_relation(relation_id):
+    query = """
+    MATCH ()-[r]->()
+    WHERE id(r) = $relation_id
+    DELETE r
+    """
+    params = {"relation_id": relation_id}
+    execute_query(query, params)
+
+    return jsonify({"message": f"Relación con ID {relation_id} eliminada"}), 200
 
 
 @app.route('/applications-by-technology', methods=['GET'])
@@ -336,4 +449,5 @@ def applications_by_region():
 if __name__ == '__main__':#
     if not os.path.exists(UPLOAD_FOLDER):
         os.makedirs(UPLOAD_FOLDER)
+    create_initial_indexes()
     app.run(debug=True)
